@@ -20,7 +20,7 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
@@ -50,6 +50,8 @@ pub(crate) struct SessionInner {
     pub sender_read: FileDescriptor,
     pub session_was_dropped: bool,
     pub shown_accept_env_error: bool,
+    pub last_keep_alive: Instant,
+    pub keep_alive: Option<Duration>,
 }
 
 impl Drop for SessionInner {
@@ -205,8 +207,7 @@ impl SessionInner {
             sess.set_option(libssh_rs::SshOption::HostKeys(host_key.to_string()))?;
         }
 
-        let sock =
-            self.connect_to_host(&hostname, port, verbose, self.config.get("proxycommand"))?;
+        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
         let raw = {
             #[cfg(unix)]
             {
@@ -288,8 +289,7 @@ impl SessionInner {
             ))))
             .context("notifying user of banner")?;
 
-        let sock =
-            self.connect_to_host(&hostname, port, verbose, self.config.get("proxycommand"))?;
+        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
 
         let mut sess = ssh2::Session::new()?;
         if verbose {
@@ -331,19 +331,18 @@ impl SessionInner {
         hostname: &str,
         port: u16,
         verbose: bool,
-        proxy_command: Option<&String>,
-    ) -> anyhow::Result<Socket> {
-        match proxy_command.map(|s| s.as_str()) {
+    ) -> anyhow::Result<(Socket, Option<KillOnDropChild>)> {
+        match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
             Some(proxy_command) => {
                 let mut cmd;
                 if cfg!(windows) {
                     let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
                     cmd = std::process::Command::new(comspec);
-                    cmd.args(&["/c", proxy_command]);
+                    cmd.args(["/c", proxy_command]);
                 } else {
                     cmd = std::process::Command::new("sh");
-                    cmd.args(&["-c", &format!("exec {}", proxy_command)]);
+                    cmd.args(["-c", &format!("exec {}", proxy_command)]);
                 }
 
                 let (a, b) = socketpair()?;
@@ -351,27 +350,37 @@ impl SessionInner {
                 cmd.stdin(b.as_stdio()?);
                 cmd.stdout(b.as_stdio()?);
                 cmd.stderr(std::process::Stdio::inherit());
-                let _child = cmd
+                let child = cmd
                     .spawn()
                     .with_context(|| format!("spawning ProxyCommand {}", proxy_command))?;
 
                 #[cfg(unix)]
                 unsafe {
+                    use passfd::FdPassingExt;
                     use std::os::unix::io::{FromRawFd, IntoRawFd};
-                    return Ok(Socket::from_raw_fd(a.into_raw_fd()));
+
+                    let raw = a.into_raw_fd();
+                    let dest = match self.config.get("proxyusefdpass").map(|s| s.as_str()) {
+                        Some("yes") => raw.recv_fd()?,
+                        _ => raw,
+                    };
+
+                    return Ok((Socket::from_raw_fd(dest), Some(KillOnDropChild(child))));
                 }
                 #[cfg(windows)]
                 unsafe {
                     use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                    return Ok(Socket::from_raw_socket(a.into_raw_socket()));
+                    return Ok((
+                        Socket::from_raw_socket(a.into_raw_socket()),
+                        Some(KillOnDropChild(child)),
+                    ));
                 }
             }
         }
 
         let addr = (hostname, port)
             .to_socket_addrs()?
-            .filter(|addr| self.filter_sock_addr(addr))
-            .next()
+            .find(|addr| self.filter_sock_addr(addr))
             .with_context(|| format!("resolving address for {}", hostname))?;
         if verbose {
             log::info!("resolved {hostname}:{port} -> {addr:?}");
@@ -380,8 +389,7 @@ impl SessionInner {
         if let Some(bind_addr) = self.config.get("bindaddress") {
             let bind_addr = (bind_addr.as_str(), 0)
                 .to_socket_addrs()?
-                .filter(|addr| self.filter_sock_addr(addr))
-                .next()
+                .find(|addr| self.filter_sock_addr(addr))
                 .with_context(|| format!("resolving bind address {bind_addr:?}"))?;
             if verbose {
                 log::info!("binding to {bind_addr:?}");
@@ -392,7 +400,7 @@ impl SessionInner {
 
         sock.connect(&addr.into())
             .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
-        Ok(sock)
+        Ok((sock, None))
     }
 
     /// Used to restrict to_socket_addrs results to the address
@@ -405,10 +413,42 @@ impl SessionInner {
         }
     }
 
+    fn do_keepalive(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
+        match sess {
+            #[cfg(feature = "ssh2")]
+            SessionWrap::Ssh2(_sess) => Ok(()),
+            #[cfg(feature = "libssh-rs")]
+            SessionWrap::LibSsh(sess) => {
+                // We implement a very basic keep alive mechanism here;
+                // every ServerAliveInterval seconds (if non-zero), we will
+                // send an ignore packet.
+                // Unlike the openssh client, we do not have a ServerAliveCountMax
+                // limit (because it is not clear how we could correctly implement
+                // that based on what we can see here in this crate), nor do we
+                // explicitly trigger a disconnect if there is an error with
+                // the ignore packet.
+                if let Some(duration) = self.keep_alive {
+                    if self.last_keep_alive.elapsed() >= duration {
+                        log::trace!("sending keep alive");
+                        self.last_keep_alive = Instant::now();
+                        let ignore_me = [0x42; 128];
+                        if let Err(err) = sess.sess.send_ignore(&ignore_me) {
+                            log::warn!(
+                                "Error sending IGNORE packet: {err:#}. Is peer disconnected?"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
         let mut sleep_delay = Duration::from_millis(100);
 
         loop {
+            self.do_keepalive(sess)?;
             self.tick_io()?;
             self.drain_request_pipe();
             self.dispatch_pending_requests(sess)?;
@@ -1085,4 +1125,18 @@ where
         log::error!("{}: {:#}", what, err);
     }
     Ok(true)
+}
+
+/// A little helper to ensure the Child process is killed on Drop.
+struct KillOnDropChild(std::process::Child);
+
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Err(err) = self.0.kill() {
+            log::error!("Error killing ProxyCommand: {}", err);
+        }
+        if let Err(err) = self.0.wait() {
+            log::error!("Error waiting for ProxyCommand to finish: {}", err);
+        }
+    }
 }
